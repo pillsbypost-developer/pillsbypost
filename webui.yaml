@@ -194,6 +194,7 @@ Resources:
               ('fulfillment_mode', 'shipping', 'Nectar mode toggle: shipping | nectar. Applies to NEW orders only; existing orders keep their mode'),
               ('local_pharmacy_appointment_type_ids', '', 'Comma-separated IntakeQ ServiceIds whose appointments are local-pharmacy orders (no export, no Nectar)'),
               ('practitioner_id', '', 'IntakeQ PractitionerId of the provider; appointment webhooks from any other practitioner are rejected'),
+              ('intake_questionnaire_ids', '', 'Comma-separated IntakeQ questionnaire ids that are main intake forms; empty = detect by name (skip follow-up/reminder/research/consent-only forms)'),
               ('honeybee_shipping_method_id', '', 'Honeybee shipping.method_id used on POST /v1/orders'),
               ('honeybee_workflow', 'partner_requested', 'Honeybee workflow: partner_requested | automatic'),
               ('tracking_retention_days', '45', 'Days before tracking entries and upload jobs are deleted (TTL)'),
@@ -238,7 +239,7 @@ Resources:
       SettingsTable: !Ref SettingsTable
       EmailTemplatesTable: !Ref EmailTemplatesTable
       # Bump to force a re-run on Update after adding keys above
-      SeedVersion: '1'
+      SeedVersion: '2'
 
   # ============================================================================
   # COGNITO

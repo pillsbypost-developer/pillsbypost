@@ -246,6 +246,8 @@ def test_stale_account_alert(harness):
 
 @pytest.mark.parametrize('name,expected', [
     ('Pills By Post Intake', True),
+    ('Medication Abortion Intake Form With Consents', True),
+    ('Formulario Para Pastillas Abortivas', True),
     ('Follow-up Questionnaire', False),
     ('Consent Form', False),
     ('Appointment Reminder', False),
@@ -255,3 +257,15 @@ def test_stale_account_alert(harness):
 ])
 def test_is_main_intake_form(worker, name, expected):
     assert worker.is_main_intake_form(name) is expected
+
+
+def test_intake_questionnaire_ids_setting_is_authoritative(worker, settings_table):
+    settings_table.put_item(Item={'config_key': 'intake_questionnaire_ids', 'value': 'q-main, q-es'})
+    worker.settings.clear_cache()
+    try:
+        assert worker.is_main_intake_form('Consent Form', 'q-main') is True
+        assert worker.is_main_intake_form('Pills By Post Intake', 'q-other') is False
+        assert worker.is_main_intake_form('Pills By Post Intake', None) is False
+    finally:
+        settings_table.put_item(Item={'config_key': 'intake_questionnaire_ids', 'value': ''})
+        worker.settings.clear_cache()
