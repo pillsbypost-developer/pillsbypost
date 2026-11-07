@@ -1,0 +1,1168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Pills By Post Web Interface - admin portal (Cognito + CloudFront + admin API), config tables, GitHub Actions deploy role'
+
+# Derived from Abuzz webui.yaml. Removed: providers, state matrix, special
+# email templates, records export. Added: payment_tiers and eligibility_rules
+# config tables. Settings/template initializers also run on stack Update
+# (idempotent conditional puts), so new keys never need manual seeding.
+# Deploy this stack BEFORE pillsbypost.yaml (it owns ApiGatewayAccount and the
+# config tables that stack references by name).
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: 'Deployment environment'
+
+  ClientName:
+    Type: String
+    Description: 'Client name for resource naming (must match pillsbypost.yaml)'
+    Default: 'pillsbypost'
+
+  ManagementAccountId:
+    Type: String
+    Description: 'AWS management account ID (hosts GitHubActionsRole)'
+    Default: '830856739018'
+
+  DomainName:
+    Type: String
+    Description: 'Custom domain name for the admin interface (optional)'
+    Default: ''
+
+  CertificateArn:
+    Type: String
+    Description: 'ACM certificate ARN in us-east-1 for the custom domain (required if DomainName provided)'
+    Default: ''
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+  HasCustomDomain: !Not [!Equals [!Ref DomainName, '']]
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+
+Resources:
+  # ============================================================================
+  # CONFIG TABLES
+  # ============================================================================
+
+  EmailTemplatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ClientName}_${Environment}_email_templates'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: template_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: template_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Sub '${ClientName}-web'
+
+  SettingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ClientName}_${Environment}_settings'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: config_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: config_key
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Sub '${ClientName}-web'
+
+  EmailSuppressionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ClientName}_${Environment}_email_suppressions'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: email
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Sub '${ClientName}-web'
+
+  # Four tiers = pharmacy choice (local|mail) x amount. tier_key e.g.
+  # 'mail_150'. intake_answer_pattern matches the intake form answer.
+  PaymentTiersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ClientName}_${Environment}_payment_tiers'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tier_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tier_key
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Sub '${ClientName}-web'
+
+  # One row per US state: served (BOOL), min_age (N), notes.
+  EligibilityRulesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ClientName}_${Environment}_eligibility_rules'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: state
+          AttributeType: S
+      KeySchema:
+        - AttributeName: state
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Sub '${ClientName}-web'
+
+  # ----------------------------------------------------------------------------
+  # Config initializer (one custom resource seeds both settings and templates).
+  # Runs on Create AND Update; conditional puts make it idempotent, so adding
+  # a key here and updating the stack seeds it without touching existing rows.
+  # ----------------------------------------------------------------------------
+
+  ConfigInitializerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClientName}-ConfigInit-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ConfigTablesPut
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource:
+                  - !GetAtt SettingsTable.Arn
+                  - !GetAtt EmailTemplatesTable.Arn
+
+  ConfigInitializerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ClientName}-config-init-${Environment}'
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt ConfigInitializerRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          from botocore.exceptions import ClientError
+
+          SETTINGS = [
+              ('client_sender_email', '', 'Sender address for patient-facing emails (must be a verified SES identity)'),
+              ('admin_sender_email', '', 'Sender address for admin notifications (must be a verified SES identity)'),
+              ('admin_recipient_email', '', 'Recipient address for admin notifications'),
+              ('fulfillment_mode', 'shipping', 'Nectar mode toggle: shipping | nectar. Applies to NEW orders only; existing orders keep their mode'),
+              ('local_pharmacy_appointment_type_ids', '', 'Comma-separated IntakeQ ServiceIds whose appointments are local-pharmacy orders (no export, no Nectar)'),
+              ('practitioner_id', '', 'IntakeQ PractitionerId of the provider; appointment webhooks from any other practitioner are rejected'),
+              ('honeybee_shipping_method_id', '', 'Honeybee shipping.method_id used on POST /v1/orders'),
+              ('honeybee_workflow', 'partner_requested', 'Honeybee workflow: partner_requested | automatic'),
+              ('tracking_retention_days', '45', 'Days before tracking entries and upload jobs are deleted (TTL)'),
+              ('orders_retention_days', '90', 'Days before exported/shipped orders are deleted (TTL applied when the order leaves NEW)'),
+              ('stale_account_months', '9', 'Months of inactivity before an IntakeQ account is considered stale'),
+          ]
+
+          TEMPLATES = [
+              ('payment', 'Payment Request', 'Sent after an eligible intake. Variables: #NAME#, #EMAIL#, #PAYLINK#, #AMOUNT#'),
+              ('ineligible', 'Ineligible', 'Sent when the state/age/condition rules exclude the patient. Variables: #NAME#, #EMAIL#'),
+              ('order_shipped', 'Order Shipped', 'Optional patient notification when tracking is recorded. Variables: #NAME#, #EMAIL#, #TRACKING#, #CARRIER#'),
+          ]
+
+          def seed(table, items, key):
+              for item in items:
+                  try:
+                      table.put_item(Item=item, ConditionExpression=f'attribute_not_exists({key})')
+                  except ClientError as e:
+                      if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                          raise
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ('Create', 'Update'):
+                      props = event['ResourceProperties']
+                      ddb = boto3.resource('dynamodb')
+                      seed(ddb.Table(props['SettingsTable']),
+                           [{'config_key': k, 'value': v, 'description': d} for k, v, d in SETTINGS],
+                           'config_key')
+                      seed(ddb.Table(props['EmailTemplatesTable']),
+                           [{'template_id': k, 'template_name': n, 'subject': '', 'body': '', 'description': d} for k, n, d in TEMPLATES],
+                           'template_id')
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  ConfigInitializer:
+    Type: Custom::ConfigInitializer
+    Properties:
+      ServiceToken: !GetAtt ConfigInitializerFunction.Arn
+      SettingsTable: !Ref SettingsTable
+      EmailTemplatesTable: !Ref EmailTemplatesTable
+      # Bump to force a re-run on Update after adding keys above
+      SeedVersion: '1'
+
+  # ============================================================================
+  # COGNITO
+  # ============================================================================
+
+  AdminUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ClientName}-admin-${Environment}'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      MfaConfiguration: "ON"
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      UserPoolAddOns:
+        AdvancedSecurityMode: ENFORCED
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailSubject: "Pills By Post Admin Portal - Set Up Your Account"
+          EmailMessage: !Sub
+            - "<html><body>Welcome to the Pills By Post Admin Portal.<br><br>An account has been created for you:<br><br><strong>Username:</strong> {username}<br><strong>Temporary Password:</strong> {####}<br><br><strong>Next steps:</strong><br>1. Visit the admin portal: <a href='${PortalUrl}'>${PortalUrl}</a><br>2. Sign in with the temporary password<br>3. Create a new password when prompted<br>4. Set up multi-factor authentication with an authenticator app<br><br>The temporary password expires in 7 days.</body></html>"
+            - PortalUrl: !If [HasCustomDomain, !Sub 'https://${DomainName}', !Sub 'https://${AdminCloudFrontDistribution.DomainName}']
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: given_name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: family_name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+
+  AdminUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref AdminUserPool
+      ClientName: !Sub '${ClientName}-admin-client-${Environment}'
+      GenerateSecret: false
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - !If
+          - HasCustomDomain
+          - !Sub 'https://${DomainName}'
+          - !Sub 'https://${AdminCloudFrontDistribution.DomainName}'
+        - !If
+          - HasCustomDomain
+          - !Sub 'https://${DomainName}/auth-callback'
+          - !Sub 'https://${AdminCloudFrontDistribution.DomainName}/auth-callback'
+      LogoutURLs:
+        - !If
+          - HasCustomDomain
+          - !Sub 'https://${DomainName}'
+          - !Sub 'https://${AdminCloudFrontDistribution.DomainName}'
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+        - aws.cognito.signin.user.admin
+      AllowedOAuthFlowsUserPoolClient: true
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+
+  AdminUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref AdminUserPool
+      Domain: !Sub '${ClientName}-admin-${Environment}-${AWS::AccountId}'
+
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref AdminUserPool
+      GroupName: Administrators
+      Description: Full administrative access
+      Precedence: 1
+
+  # ============================================================================
+  # S3 + CLOUDFRONT FOR THE ADMIN FRONTEND
+  # ============================================================================
+
+  AdminWebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ClientName}-admin-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Sub '${ClientName}-web'
+
+  AdminWebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AdminWebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${AdminWebsiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${AdminCloudFrontDistribution}'
+
+  AdminOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ClientName}-admin-oac-${Environment}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        Description: !Sub 'Origin Access Control for ${ClientName} admin interface'
+
+  AdminCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt AdminWebsiteBucket.RegionalDomainName
+            Id: S3Origin
+            OriginAccessControlId: !Ref AdminOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        Enabled: true
+        DefaultRootObject: index.html
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref DomainName]
+          - !Ref 'AWS::NoValue'
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        PriceClass: PriceClass_100
+        ViewerCertificate: !If
+          - HasCertificate
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        HttpVersion: http2
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Sub '${ClientName}-web'
+
+  # ============================================================================
+  # IAM
+  # ============================================================================
+
+  ApiGatewayCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClientName}-ApiGatewayCloudWatchLogs-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # Account-level setting; also required by the webhook API stage in pillsbypost.yaml
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchLogsRole.Arn
+
+  AdminLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClientName}-AdminLambdaExecution-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AdminDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  # Config tables (this stack)
+                  - !GetAtt EmailTemplatesTable.Arn
+                  - !GetAtt SettingsTable.Arn
+                  - !GetAtt EmailSuppressionsTable.Arn
+                  - !GetAtt PaymentTiersTable.Arn
+                  - !GetAtt EligibilityRulesTable.Arn
+                  # Operational tables (pillsbypost.yaml, constructed ARNs)
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}_orders'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}_orders/index/*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}_intakes'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}_intakes/index/*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}_honeybee_events'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}_honeybee_events/index/*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}_tracking'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}_tracking/index/*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}_tracking_jobs'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}_tracking_jobs/index/*'
+        - PolicyName: TrackingBatchInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ClientName}-${Environment}-tracking-batch'
+        # Admin actions: re-queue a Nectar order, mark paid (IntakeQ tags),
+        # cancel a Honeybee order
+        - PolicyName: NectarQueueSend
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${Environment}-nectar-order-queue'
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ClientName}/${Environment}/intakeq-api-key-*'
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ClientName}/${Environment}/honeybee-oauth-*'
+        - PolicyName: SESAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+
+  # GitHub Actions deployment role (assumed via role chaining from
+  # GitHubActionsRole in the management account). Covers Lambdas in BOTH
+  # stacks plus the admin site.
+  WebDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClientName}-WebDeploy-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${ManagementAccountId}:role/GitHubActionsRole'
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      Policies:
+        - PolicyName: LambdaDeploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionConfiguration
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*-${Environment}'
+        - PolicyName: WebS3Deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt AdminWebsiteBucket.Arn
+                  - !Sub '${AdminWebsiteBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${AdminCloudFrontDistribution}'
+        - PolicyName: CloudFormationRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/webui-${Environment}/*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ClientName}-${Environment}/*'
+
+  # ============================================================================
+  # LAMBDA — GENERIC CRUD HANDLER
+  # ============================================================================
+
+  AdminCRUDFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'admin-crud-handler-${Environment}'
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt AdminLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder - deploy via GitHub Actions'}
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+          EMAIL_TEMPLATES_TABLE: !Ref EmailTemplatesTable
+          SETTINGS_TABLE: !Ref SettingsTable
+          EMAIL_SUPPRESSIONS_TABLE: !Ref EmailSuppressionsTable
+          PAYMENT_TIERS_TABLE: !Ref PaymentTiersTable
+          ELIGIBILITY_RULES_TABLE: !Ref EligibilityRulesTable
+          # Operational tables from pillsbypost.yaml
+          ORDERS_TABLE: !Sub '${Environment}_orders'
+          INTAKES_TABLE: !Sub '${Environment}_intakes'
+          HONEYBEE_EVENTS_TABLE: !Sub '${Environment}_honeybee_events'
+          TRACKING_TABLE: !Sub '${Environment}_tracking'
+          TRACKING_JOBS_TABLE: !Sub '${Environment}_tracking_jobs'
+          NECTAR_ORDER_QUEUE_URL: !Sub 'https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/${Environment}-nectar-order-queue'
+          INTAKEQ_API_SECRET: !Sub '${ClientName}/${Environment}/intakeq-api-key'
+          HONEYBEE_OAUTH_SECRET: !Sub '${ClientName}/${Environment}/honeybee-oauth'
+          HONEYBEE_API_BASE: !If [IsProduction, 'https://partners.honeybeehealth.com/v1', 'https://partners.sandbox.honeybeehealth.com/v1']
+          HONEYBEE_AUTH_URL: 'https://auth.honeybeehealth.com/oauth/token'
+          SES_CONFIGURATION_SET: !Sub '${ClientName}-${Environment}-ses-config'
+          CORS_ORIGIN: !If
+            - HasCustomDomain
+            - !Sub 'https://${DomainName}'
+            - !Sub 'https://${AdminCloudFrontDistribution.DomainName}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Sub '${ClientName}-web'
+
+  AdminCRUDLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/admin-crud-handler-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+
+  # ============================================================================
+  # LAMBDA — TRACKING UPLOAD (async batch via Step Functions in pillsbypost.yaml)
+  # ============================================================================
+
+  TrackingInitiateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'tracking-initiate-${Environment}'
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt AdminLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder - deploy via GitHub Actions'}
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+          TRACKING_TABLE: !Sub '${Environment}_tracking'
+          TRACKING_JOBS_TABLE: !Sub '${Environment}_tracking_jobs'
+          ORDERS_TABLE: !Sub '${Environment}_orders'
+          STATE_MACHINE_ARN: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ClientName}-${Environment}-tracking-batch'
+          SETTINGS_TABLE: !Ref SettingsTable
+          CORS_ORIGIN: !If
+            - HasCustomDomain
+            - !Sub 'https://${DomainName}'
+            - !Sub 'https://${AdminCloudFrontDistribution.DomainName}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Sub '${ClientName}-web'
+
+  TrackingInitiateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/tracking-initiate-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+
+  ApiGatewayAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ClientName}-admin-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+
+  # ============================================================================
+  # WAF FOR THE ADMIN API
+  # ============================================================================
+
+  AdminApiWAF:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${ClientName}-admin-api-waf-${Environment}'
+      Scope: REGIONAL
+      Description: !Sub 'WAF for ${ClientName} admin API'
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: RateLimitPerIP
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: 100
+              AggregateKeyType: IP
+          Action:
+            Block:
+              CustomResponse:
+                ResponseCode: 429
+                CustomResponseBodyKey: RateLimitExceeded
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIP
+
+        # /tracking-upload carries a whole CSV in the body; exclude it from
+        # body inspection
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 2
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ScopeDownStatement:
+                NotStatement:
+                  Statement:
+                    ByteMatchStatement:
+                      SearchString: /tracking-upload
+                      FieldToMatch:
+                        UriPath: {}
+                      TextTransformations:
+                        - Priority: 0
+                          Type: NONE
+                      PositionalConstraint: ENDS_WITH
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 3
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+              ScopeDownStatement:
+                NotStatement:
+                  Statement:
+                    ByteMatchStatement:
+                      SearchString: /tracking-upload
+                      FieldToMatch:
+                        UriPath: {}
+                      TextTransformations:
+                        - Priority: 0
+                          Type: NONE
+                      PositionalConstraint: ENDS_WITH
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSet
+
+      CustomResponseBodies:
+        RateLimitExceeded:
+          ContentType: APPLICATION_JSON
+          Content: '{"error":"Rate limit exceeded","message":"Too many requests. Please try again in a few minutes.","retryAfter":300}'
+
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ClientName}AdminApiWAF'
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Sub '${ClientName}-web'
+
+  AdminApiWAFAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn:
+      - AdminApiStage
+    Properties:
+      ResourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/restapis/${AdminApi}/stages/${Environment}'
+      WebACLArn: !GetAtt AdminApiWAF.Arn
+
+  RateLimitAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClientName}-WAF-RateLimitBlocks-${Environment}'
+      AlarmDescription: Alert when users are being rate limited by WAF
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Rule
+          Value: RateLimitPerIP
+        - Name: WebACL
+          Value: !Sub '${ClientName}-admin-api-waf-${Environment}'
+        - Name: Region
+          Value: !Ref AWS::Region
+      TreatMissingData: notBreaching
+
+  # ============================================================================
+  # API GATEWAY — ADMIN API
+  # ============================================================================
+
+  AdminApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ClientName}-admin-api-${Environment}'
+      Description: !Sub '${ClientName} admin interface API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Sub '${ClientName}-web'
+
+  AdminApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      RestApiId: !Ref AdminApi
+      Name: CognitoAuthorizer
+      Type: COGNITO_USER_POOLS
+      ProviderARNs:
+        - !GetAtt AdminUserPool.Arn
+      IdentitySource: method.request.header.Authorization
+
+  # Generic table routes: /{table} and /{table}/{id}
+  TableResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AdminApi
+      ParentId: !GetAtt AdminApi.RootResourceId
+      PathPart: '{table}'
+
+  TableIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AdminApi
+      ParentId: !Ref TableResource
+      PathPart: '{id}'
+
+  TableGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdminApi
+      ResourceId: !Ref TableResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AdminApiAuthorizer
+      RequestParameters:
+        method.request.path.table: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminCRUDFunction.Arn}/invocations'
+
+  TablePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdminApi
+      ResourceId: !Ref TableResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AdminApiAuthorizer
+      RequestParameters:
+        method.request.path.table: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminCRUDFunction.Arn}/invocations'
+
+  TableOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdminApi
+      ResourceId: !Ref TableResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminCRUDFunction.Arn}/invocations'
+
+  TableIdGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdminApi
+      ResourceId: !Ref TableIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AdminApiAuthorizer
+      RequestParameters:
+        method.request.path.table: true
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminCRUDFunction.Arn}/invocations'
+
+  TableIdPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdminApi
+      ResourceId: !Ref TableIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AdminApiAuthorizer
+      RequestParameters:
+        method.request.path.table: true
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminCRUDFunction.Arn}/invocations'
+
+  # Sub-resource actions, e.g. POST /orders/export-batch, POST /orders/{id}/mark-paid
+  TableIdPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdminApi
+      ResourceId: !Ref TableIdResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AdminApiAuthorizer
+      RequestParameters:
+        method.request.path.table: true
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminCRUDFunction.Arn}/invocations'
+
+  TableIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdminApi
+      ResourceId: !Ref TableIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AdminApiAuthorizer
+      RequestParameters:
+        method.request.path.table: true
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminCRUDFunction.Arn}/invocations'
+
+  TableIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdminApi
+      ResourceId: !Ref TableIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminCRUDFunction.Arn}/invocations'
+
+  AdminCRUDPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AdminCRUDFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AdminApi}/*/*'
+
+  # POST /tracking-upload
+  TrackingUploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AdminApi
+      ParentId: !GetAtt AdminApi.RootResourceId
+      PathPart: tracking-upload
+
+  TrackingUploadPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdminApi
+      ResourceId: !Ref TrackingUploadResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref AdminApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TrackingInitiateFunction.Arn}/invocations'
+
+  TrackingUploadOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AdminApi
+      ResourceId: !Ref TrackingUploadResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TrackingInitiateFunction.Arn}/invocations'
+
+  TrackingInitiateApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TrackingInitiateFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AdminApi}/*/*'
+
+  # Rename (V2, V3...) whenever routes change; deployments are immutable.
+  AdminApiDeploymentV1:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - TableGetMethod
+      - TablePostMethod
+      - TableOptionsMethod
+      - TableIdGetMethod
+      - TableIdPostMethod
+      - TableIdPutMethod
+      - TableIdDeleteMethod
+      - TableIdOptionsMethod
+      - TrackingUploadPostMethod
+      - TrackingUploadOptionsMethod
+    Properties:
+      RestApiId: !Ref AdminApi
+
+  AdminApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn:
+      - ApiGatewayAccount
+    Properties:
+      RestApiId: !Ref AdminApi
+      DeploymentId: !Ref AdminApiDeploymentV1
+      StageName: !Ref Environment
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","integrationLatency":"$context.integrationLatency","userAgent":"$context.identity.userAgent"}'
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 100
+          ThrottlingBurstLimit: 200
+          LoggingLevel: INFO
+          DataTraceEnabled: !If [IsProduction, false, true]
+          MetricsEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Sub '${ClientName}-web'
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+Outputs:
+  AdminApiUrl:
+    Description: 'Admin API Gateway endpoint URL'
+    Value: !Sub 'https://${AdminApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminApiUrl'
+
+  AdminWebsiteUrl:
+    Description: 'Admin website URL'
+    Value: !If
+      - HasCustomDomain
+      - !Sub 'https://${DomainName}'
+      - !Sub 'https://${AdminCloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminWebsiteUrl'
+
+  AdminUserPoolId:
+    Value: !Ref AdminUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminUserPoolId'
+
+  AdminUserPoolClientId:
+    Value: !Ref AdminUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminUserPoolClientId'
+
+  AdminCognitoDomain:
+    Description: 'Hosted UI domain (used by the web deploy workflow)'
+    Value: !Sub '${ClientName}-admin-${Environment}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminCognitoDomain'
+
+  AdminWebsiteBucketName:
+    Value: !Ref AdminWebsiteBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminWebsiteBucket'
+
+  AdminCloudFrontDistributionId:
+    Value: !Ref AdminCloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminCloudFrontDistributionId'
+
+  EmailTemplatesTableName:
+    Value: !Ref EmailTemplatesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailTemplatesTable'
+
+  SettingsTableName:
+    Value: !Ref SettingsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-SettingsTable'
+
+  EmailSuppressionsTableName:
+    Value: !Ref EmailSuppressionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-EmailSuppressionsTable'
+
+  PaymentTiersTableName:
+    Value: !Ref PaymentTiersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PaymentTiersTable'
+
+  EligibilityRulesTableName:
+    Value: !Ref EligibilityRulesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-EligibilityRulesTable'
+
+  WebDeployRoleArn:
+    Description: 'GitHub Actions deployment role ARN (assumed from GitHubActionsRole)'
+    Value: !GetAtt WebDeployRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebDeployRole'
+
+  WAFWebACLArn:
+    Value: !GetAtt AdminApiWAF.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WAFWebACLArn'

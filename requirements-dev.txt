@@ -1,0 +1,3 @@
+# Test dependencies (CI runs: pip install -r requirements.txt -r requirements-dev.txt)
+pytest==8.3.5
+moto==5.1.1

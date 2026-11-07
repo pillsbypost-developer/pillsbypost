@@ -1,0 +1,87 @@
+name: Deploy Web Interface to DEV
+
+# Cognito/API/CloudFront values are read from the webui-dev stack outputs at
+# run time (the deploy role has cloudformation:DescribeStacks on it), so
+# nothing environment-specific is hardcoded here except account IDs.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  STACK_NAME: webui-dev
+  MANAGEMENT_ROLE: arn:aws:iam::830856739018:role/GitHubActionsRole
+  DEPLOY_ROLE: arn:aws:iam::881746719623:role/pillsbypost-WebDeploy-dev
+
+jobs:
+  deploy-web:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend-app/package-lock.json
+
+      - name: Install dependencies and build
+        run: |
+          cd frontend-app
+          npm ci
+          npx vite build
+
+      - name: Configure AWS credentials (management account via OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.MANAGEMENT_ROLE }}
+          role-session-name: github-actions-session
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Assume dev deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          role-session-name: dev-web-deploy
+          aws-region: ${{ env.AWS_REGION }}
+          role-chaining: true
+
+      - name: Read stack outputs
+        id: stack
+        run: |
+          get() { aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+                    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          echo "user_pool_id=$(get AdminUserPoolId)"       >> "$GITHUB_OUTPUT"
+          echo "client_id=$(get AdminUserPoolClientId)"    >> "$GITHUB_OUTPUT"
+          echo "cognito_domain=$(get AdminCognitoDomain)"  >> "$GITHUB_OUTPUT"
+          echo "api_url=$(get AdminApiUrl)"                >> "$GITHUB_OUTPUT"
+          echo "bucket=$(get AdminWebsiteBucketName)"      >> "$GITHUB_OUTPUT"
+          echo "distribution=$(get AdminCloudFrontDistributionId)" >> "$GITHUB_OUTPUT"
+
+      - name: Inject configuration placeholders
+        run: |
+          cd frontend-app/dist
+          find . -type f \( -name "*.js" -o -name "index.html" \) -exec sed -i \
+            -e "s|{{USER_POOL_ID}}|${{ steps.stack.outputs.user_pool_id }}|g" \
+            -e "s|{{CLIENT_ID}}|${{ steps.stack.outputs.client_id }}|g" \
+            -e "s|{{COGNITO_DOMAIN}}|${{ steps.stack.outputs.cognito_domain }}|g" \
+            -e "s|{{API_URL}}|${{ steps.stack.outputs.api_url }}|g" \
+            {} +
+
+      - name: Deploy to S3
+        run: |
+          aws s3 sync frontend-app/dist/ "s3://${{ steps.stack.outputs.bucket }}/" \
+            --delete \
+            --cache-control "public, max-age=3600"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.stack.outputs.distribution }}" \
+            --paths "/*"

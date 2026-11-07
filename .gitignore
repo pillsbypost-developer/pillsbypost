@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+lambdas/*/package/
+lambdas/*/deployment_package.zip
+frontend-app/node_modules/
+frontend-app/dist/
+.DS_Store
+.env

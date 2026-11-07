@@ -1,0 +1,1583 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Pills By Post application infrastructure - IntakeQ intake/approval webhooks, Converge payment confirmation, Honeybee Nectar fulfillment, shipping tracking'
+
+# Derived from Abuzz buzzflow.yaml. Differences: single provider (no providers
+# table / provider GSIs), orders table replaces appointments, Honeybee Nectar
+# resources (honeybee_events table, nectar-order-queue, honeybee-webhook,
+# nectar-order-submit), no records-export machinery, no Brevo. The GitHub
+# Actions deploy role lives in webui.yaml (pillsbypost-WebDeploy-<env>).
+# Deploy webui.yaml FIRST: it configures the account-level API Gateway
+# CloudWatch role and creates the config tables referenced here by name.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: 'Deployment environment'
+
+  ClientName:
+    Type: String
+    Description: 'Client name for resource naming (must match webui.yaml)'
+    Default: 'pillsbypost'
+
+  OpsAlertEmail:
+    Type: String
+    Description: 'Email address that receives CloudWatch alarm notifications (subscription must be confirmed via email after deploy)'
+
+  WebhookPathToken:
+    Type: String
+    Description: 'Random path segment appended to every webhook route (e.g. /intake/<token>). IntakeQ webhooks are unsigned, so this is the only thing stopping anyone who guesses the API URL. Generate with: openssl rand -hex 16'
+    MinLength: 16
+    AllowedPattern: '^[A-Za-z0-9_-]+$'
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # ============================================================================
+  # DYNAMODB TABLES (operational). Config tables live in webui.yaml.
+  # ============================================================================
+
+  IntakesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}_intakes'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: intake_id
+          AttributeType: S
+        - AttributeName: client_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: intake_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: client-index
+          KeySchema:
+            - AttributeName: client_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  # One record per provider approval (IntakeQ appointment). order_id is the
+  # IntakeQ appointment Id. fulfillment_mode is fixed on the record at
+  # creation so flipping the Nectar toggle never changes in-flight orders.
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}_orders'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+        - AttributeName: client_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: approval_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: client-index
+          KeySchema:
+            - AttributeName: client_id
+              KeyType: HASH
+            - AttributeName: approval_date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: approval_date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  # Honeybee webhook idempotency + audit. Conditional put on event_id; Honeybee
+  # redelivers events, and PATCH /webhooks/{event_id} replays them on demand.
+  HoneybeeEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}_honeybee_events'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+        - AttributeName: patient_id
+          AttributeType: S
+        - AttributeName: received_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: patient-index
+          KeySchema:
+            - AttributeName: patient_id
+              KeyType: HASH
+            - AttributeName: received_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  TrackingJobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}_tracking_jobs'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  TrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}_tracking'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tracking_id
+          AttributeType: S
+        - AttributeName: client_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tracking_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: client-tracking-index
+          KeySchema:
+            - AttributeName: client_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  # ============================================================================
+  # SQS — INTAKE PROCESSING QUEUE
+  # ============================================================================
+  # intake-webhook claims the intake_id (conditional put) and enqueues here;
+  # intake-worker consumes and runs the slow IntakeQ orchestration. Keeps
+  # webhook responses under API Gateway's 29s cap and makes IntakeQ webhook
+  # retries idempotent.
+
+  IntakeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-intake-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  IntakeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-intake-queue'
+      # Must be >= 6x the intake-worker Lambda timeout (300s) per AWS guidance
+      VisibilityTimeout: 1800
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IntakeDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  # ============================================================================
+  # SQS — NECTAR ORDER SUBMISSION QUEUE
+  # ============================================================================
+  # appointment-webhook / honeybee-webhook enqueue an order_id once an approved
+  # order has a matching Honeybee prescription; nectar-order-submit consumes
+  # and calls POST /v1/orders. Decoupled so Honeybee outages retry safely.
+
+  NectarOrderDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-nectar-order-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  NectarOrderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-nectar-order-queue'
+      # >= 6x the nectar-order-submit timeout (60s)
+      VisibilityTimeout: 360
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NectarOrderDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  # ============================================================================
+  # SECRETS MANAGER (placeholders; set real values in the console after deploy)
+  # ============================================================================
+
+  IntakeQApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ClientName}/${Environment}/intakeq-api-key'
+      Description: 'IntakeQ Developer API key'
+      SecretString: |
+        {
+          "api_key": "PLACEHOLDER_UPDATE_AFTER_DEPLOYMENT"
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  HoneybeeOAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ClientName}/${Environment}/honeybee-oauth'
+      Description: 'Honeybee Health Partners API OAuth2 client-credentials'
+      SecretString: |
+        {
+          "client_id": "PLACEHOLDER_UPDATE_AFTER_DEPLOYMENT",
+          "client_secret": "PLACEHOLDER_UPDATE_AFTER_DEPLOYMENT"
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  HoneybeeWebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ClientName}/${Environment}/honeybee-webhook-secret'
+      Description: 'Shared secret used to verify the X-Honeybee-Signature header'
+      SecretString: |
+        {
+          "signing_secret": "PLACEHOLDER_UPDATE_AFTER_DEPLOYMENT"
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  ConvergeSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ClientName}/${Environment}/converge'
+      Description: 'Elavon Converge credentials for transaction verification (decision D4)'
+      SecretString: |
+        {
+          "merchant_id": "PLACEHOLDER_UPDATE_AFTER_DEPLOYMENT",
+          "user_id": "PLACEHOLDER_UPDATE_AFTER_DEPLOYMENT",
+          "pin": "PLACEHOLDER_UPDATE_AFTER_DEPLOYMENT"
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  # ============================================================================
+  # IAM
+  # ============================================================================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClientName}-LambdaExecution-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  # Operational tables (this stack)
+                  - !GetAtt IntakesTable.Arn
+                  - !Sub '${IntakesTable.Arn}/index/*'
+                  - !GetAtt OrdersTable.Arn
+                  - !Sub '${OrdersTable.Arn}/index/*'
+                  - !GetAtt HoneybeeEventsTable.Arn
+                  - !Sub '${HoneybeeEventsTable.Arn}/index/*'
+                  - !GetAtt TrackingTable.Arn
+                  - !Sub '${TrackingTable.Arn}/index/*'
+                  - !GetAtt TrackingJobsTable.Arn
+                  - !Sub '${TrackingJobsTable.Arn}/index/*'
+                  # Config tables (webui.yaml, referenced via constructed ARNs)
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ClientName}_${Environment}_settings'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ClientName}_${Environment}_email_templates'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ClientName}_${Environment}_email_suppressions'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ClientName}_${Environment}_payment_tiers'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ClientName}_${Environment}_eligibility_rules'
+        - PolicyName: QueueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt IntakeQueue.Arn
+                  - !GetAtt NectarOrderQueue.Arn
+              # Consumers (required by the SQS event source mappings)
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt IntakeQueue.Arn
+                  - !GetAtt NectarOrderQueue.Arn
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref IntakeQApiSecret
+                  - !Ref HoneybeeOAuthSecret
+                  - !Ref HoneybeeWebhookSecret
+                  - !Ref ConvergeSecret
+        - PolicyName: SESAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS
+  # ============================================================================
+  # All functions start as placeholders; code is deployed by the GitHub Actions
+  # workflows (common/ is bundled into each package - no layer).
+
+  IntakeWebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'intake-webhook-${Environment}'
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder - deploy via GitHub Actions'}
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+          INTAKES_TABLE: !Ref IntakesTable
+          INTAKE_QUEUE_URL: !Ref IntakeQueue
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  IntakeWorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'intake-worker-${Environment}'
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder - deploy via GitHub Actions'}
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+          INTAKES_TABLE: !Ref IntakesTable
+          SETTINGS_TABLE: !Sub '${ClientName}_${Environment}_settings'
+          EMAIL_TEMPLATES_TABLE: !Sub '${ClientName}_${Environment}_email_templates'
+          EMAIL_SUPPRESSIONS_TABLE: !Sub '${ClientName}_${Environment}_email_suppressions'
+          PAYMENT_TIERS_TABLE: !Sub '${ClientName}_${Environment}_payment_tiers'
+          ELIGIBILITY_RULES_TABLE: !Sub '${ClientName}_${Environment}_eligibility_rules'
+          SES_CONFIGURATION_SET: !Sub '${ClientName}-${Environment}-ses-config'
+          INTAKEQ_API_SECRET: !Ref IntakeQApiSecret
+          # Seconds to sleep between IntakeQ API calls (0 = none)
+          INTAKEQ_API_DELAY: '0'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  IntakeWorkerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IntakeQueue.Arn
+      FunctionName: !GetAtt IntakeWorkerFunction.Arn
+      # One intake per invocation: a failure retries only that message
+      BatchSize: 1
+      Enabled: true
+
+  AppointmentWebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'appointment-webhook-${Environment}'
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder - deploy via GitHub Actions'}
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+          INTAKES_TABLE: !Ref IntakesTable
+          ORDERS_TABLE: !Ref OrdersTable
+          HONEYBEE_EVENTS_TABLE: !Ref HoneybeeEventsTable
+          SETTINGS_TABLE: !Sub '${ClientName}_${Environment}_settings'
+          PAYMENT_TIERS_TABLE: !Sub '${ClientName}_${Environment}_payment_tiers'
+          NECTAR_ORDER_QUEUE_URL: !Ref NectarOrderQueue
+          INTAKEQ_API_SECRET: !Ref IntakeQApiSecret
+          HONEYBEE_OAUTH_SECRET: !Ref HoneybeeOAuthSecret
+          HONEYBEE_API_BASE: !If [IsProduction, 'https://partners.honeybeehealth.com/v1', 'https://partners.sandbox.honeybeehealth.com/v1']
+          HONEYBEE_AUTH_URL: 'https://auth.honeybeehealth.com/oauth/token'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  PaymentWebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'payment-webhook-${Environment}'
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder - deploy via GitHub Actions'}
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+          INTAKES_TABLE: !Ref IntakesTable
+          ORDERS_TABLE: !Ref OrdersTable
+          SETTINGS_TABLE: !Sub '${ClientName}_${Environment}_settings'
+          EMAIL_SUPPRESSIONS_TABLE: !Sub '${ClientName}_${Environment}_email_suppressions'
+          SES_CONFIGURATION_SET: !Sub '${ClientName}-${Environment}-ses-config'
+          INTAKEQ_API_SECRET: !Ref IntakeQApiSecret
+          CONVERGE_SECRET: !Ref ConvergeSecret
+          CONVERGE_API_BASE: !If [IsProduction, 'https://api.convergepay.com/VirtualMerchant', 'https://api.demo.convergepay.com/VirtualMerchantDemo']
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  HoneybeeWebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'honeybee-webhook-${Environment}'
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder - deploy via GitHub Actions'}
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+          ORDERS_TABLE: !Ref OrdersTable
+          TRACKING_TABLE: !Ref TrackingTable
+          HONEYBEE_EVENTS_TABLE: !Ref HoneybeeEventsTable
+          SETTINGS_TABLE: !Sub '${ClientName}_${Environment}_settings'
+          EMAIL_SUPPRESSIONS_TABLE: !Sub '${ClientName}_${Environment}_email_suppressions'
+          SES_CONFIGURATION_SET: !Sub '${ClientName}-${Environment}-ses-config'
+          NECTAR_ORDER_QUEUE_URL: !Ref NectarOrderQueue
+          INTAKEQ_API_SECRET: !Ref IntakeQApiSecret
+          HONEYBEE_OAUTH_SECRET: !Ref HoneybeeOAuthSecret
+          HONEYBEE_WEBHOOK_SECRET: !Ref HoneybeeWebhookSecret
+          HONEYBEE_API_BASE: !If [IsProduction, 'https://partners.honeybeehealth.com/v1', 'https://partners.sandbox.honeybeehealth.com/v1']
+          HONEYBEE_AUTH_URL: 'https://auth.honeybeehealth.com/oauth/token'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  NectarOrderSubmitFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'nectar-order-submit-${Environment}'
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder - deploy via GitHub Actions'}
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+          ORDERS_TABLE: !Ref OrdersTable
+          SETTINGS_TABLE: !Sub '${ClientName}_${Environment}_settings'
+          EMAIL_SUPPRESSIONS_TABLE: !Sub '${ClientName}_${Environment}_email_suppressions'
+          SES_CONFIGURATION_SET: !Sub '${ClientName}-${Environment}-ses-config'
+          INTAKEQ_API_SECRET: !Ref IntakeQApiSecret
+          HONEYBEE_OAUTH_SECRET: !Ref HoneybeeOAuthSecret
+          HONEYBEE_API_BASE: !If [IsProduction, 'https://partners.honeybeehealth.com/v1', 'https://partners.sandbox.honeybeehealth.com/v1']
+          HONEYBEE_AUTH_URL: 'https://auth.honeybeehealth.com/oauth/token'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  NectarOrderSubmitEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt NectarOrderQueue.Arn
+      FunctionName: !GetAtt NectarOrderSubmitFunction.Arn
+      BatchSize: 1
+      Enabled: true
+
+  TrackingProcessEntryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'tracking-process-entry-${Environment}'
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder - deploy via GitHub Actions'}
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+          TRACKING_TABLE: !Ref TrackingTable
+          TRACKING_JOBS_TABLE: !Ref TrackingJobsTable
+          ORDERS_TABLE: !Ref OrdersTable
+          INTAKEQ_API_SECRET: !Ref IntakeQApiSecret
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  # ============================================================================
+  # STEP FUNCTIONS — TRACKING BATCH PROCESSOR (as buzzflow)
+  # ============================================================================
+
+  TrackingBatchStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClientName}-${Environment}-tracking-stepfunctions-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TrackingBatchStepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt TrackingProcessEntryFunction.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt TrackingJobsTable.Arn
+
+  TrackingBatchStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ClientName}-${Environment}-tracking-batch'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt TrackingBatchStepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Tracking Number Batch Processor - processes entries sequentially (IntakeQ rate limit)",
+          "StartAt": "SetProcessing",
+          "States": {
+            "SetProcessing": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${TrackingJobsTable}",
+                "Key": {
+                  "job_id": {"S.$": "$.job_id"}
+                },
+                "UpdateExpression": "SET #s = :s",
+                "ExpressionAttributeNames": {"#s": "status"},
+                "ExpressionAttributeValues": {":s": {"S": "PROCESSING"}}
+              },
+              "ResultPath": null,
+              "Next": "ProcessEntries"
+            },
+            "ProcessEntries": {
+              "Type": "Map",
+              "MaxConcurrency": 1,
+              "ItemsPath": "$.entries",
+              "ItemSelector": {
+                "job_id.$": "$.job_id",
+                "entry.$": "$$.Map.Item.Value"
+              },
+              "ItemProcessor": {
+                "ProcessorConfig": {
+                  "Mode": "INLINE"
+                },
+                "StartAt": "ProcessEntry",
+                "States": {
+                  "ProcessEntry": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${TrackingProcessEntryFunction.Arn}",
+                      "Payload.$": "$"
+                    },
+                    "ResultPath": null,
+                    "End": true
+                  }
+                }
+              },
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "SetFailed"
+                }
+              ],
+              "ResultPath": null,
+              "Next": "SetCompleted"
+            },
+            "SetCompleted": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${TrackingJobsTable}",
+                "Key": {
+                  "job_id": {"S.$": "$.job_id"}
+                },
+                "UpdateExpression": "SET #s = :s, completed_at = :t",
+                "ExpressionAttributeNames": {"#s": "status"},
+                "ExpressionAttributeValues": {
+                  ":s": {"S": "COMPLETED"},
+                  ":t": {"S.$": "$$.State.EnteredTime"}
+                }
+              },
+              "ResultPath": null,
+              "End": true
+            },
+            "SetFailed": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${TrackingJobsTable}",
+                "Key": {
+                  "job_id": {"S.$": "$.job_id"}
+                },
+                "UpdateExpression": "SET #s = :s, completed_at = :t",
+                "ExpressionAttributeNames": {"#s": "status"},
+                "ExpressionAttributeValues": {
+                  ":s": {"S": "FAILED"},
+                  ":t": {"S.$": "$$.State.EnteredTime"}
+                }
+              },
+              "ResultPath": null,
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  TrackingStateMachineArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ClientName}/${Environment}/tracking-state-machine-arn'
+      Type: String
+      Value: !Ref TrackingBatchStateMachine
+
+  # ============================================================================
+  # SES BOUNCE/COMPLAINT HANDLING
+  # ============================================================================
+
+  SESBounceTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ClientName}-${Environment}-ses-bounces'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  SESComplaintTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ClientName}-${Environment}-ses-complaints'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  SESConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Sub '${ClientName}-${Environment}-ses-config'
+
+  SESBounceEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Properties:
+      ConfigurationSetName: !Ref SESConfigurationSet
+      EventDestination:
+        Name: !Sub '${ClientName}-${Environment}-bounce-destination'
+        Enabled: true
+        MatchingEventTypes:
+          - bounce
+        SnsDestination:
+          TopicARN: !Ref SESBounceTopic
+
+  SESComplaintEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Properties:
+      ConfigurationSetName: !Ref SESConfigurationSet
+      EventDestination:
+        Name: !Sub '${ClientName}-${Environment}-complaint-destination'
+        Enabled: true
+        MatchingEventTypes:
+          - complaint
+        SnsDestination:
+          TopicARN: !Ref SESComplaintTopic
+
+  SESNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'ses-notifications-${Environment}'
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder - deploy via GitHub Actions'}
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENV: !Ref Environment
+          LOG_LEVEL: !If [IsProduction, 'INFO', 'DEBUG']
+          EMAIL_SUPPRESSIONS_TABLE: !Sub '${ClientName}_${Environment}_email_suppressions'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  SESBounceSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SESBounceTopic
+      Protocol: lambda
+      Endpoint: !GetAtt SESNotificationFunction.Arn
+
+  SESComplaintSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SESComplaintTopic
+      Protocol: lambda
+      Endpoint: !GetAtt SESNotificationFunction.Arn
+
+  SESBounceLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SESNotificationFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref SESBounceTopic
+
+  SESComplaintLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SESNotificationFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref SESComplaintTopic
+
+  # ============================================================================
+  # CLOUDWATCH LOG GROUPS
+  # ============================================================================
+
+  IntakeWebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/intake-webhook-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  IntakeWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/intake-worker-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  AppointmentWebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/appointment-webhook-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  PaymentWebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/payment-webhook-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  HoneybeeWebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/honeybee-webhook-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  NectarOrderSubmitLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/nectar-order-submit-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  TrackingProcessEntryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/tracking-process-entry-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  SESNotificationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/ses-notifications-${Environment}'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # ============================================================================
+  # API GATEWAY — WEBHOOKS
+  # ============================================================================
+  # Every route is /<name>/<WebhookPathToken>. IntakeQ and Converge callbacks
+  # are unsigned, so the token is the access control; Honeybee is additionally
+  # verified by X-Honeybee-Signature in the function.
+
+  WebhookApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ClientName}-api-${Environment}'
+      Description: 'Pills By Post webhook API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  # Lambda permissions
+  IntakeWebhookApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt IntakeWebhookFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*/POST/intake/*'
+
+  AppointmentWebhookApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AppointmentWebhookFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*/POST/appointment/*'
+
+  PaymentWebhookApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PaymentWebhookFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*/POST/payment/*'
+
+  HoneybeeWebhookApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt HoneybeeWebhookFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*/POST/honeybee/*'
+
+  # /intake/<token>
+  IntakeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !GetAtt WebhookApi.RootResourceId
+      PathPart: intake
+
+  IntakeTokenResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !Ref IntakeResource
+      PathPart: !Ref WebhookPathToken
+
+  IntakeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ResourceId: !Ref IntakeTokenResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IntakeWebhookFunction.Arn}/invocations'
+
+  # /appointment/<token>
+  AppointmentResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !GetAtt WebhookApi.RootResourceId
+      PathPart: appointment
+
+  AppointmentTokenResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !Ref AppointmentResource
+      PathPart: !Ref WebhookPathToken
+
+  AppointmentMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ResourceId: !Ref AppointmentTokenResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AppointmentWebhookFunction.Arn}/invocations'
+
+  # /payment/<token>
+  PaymentResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !GetAtt WebhookApi.RootResourceId
+      PathPart: payment
+
+  PaymentTokenResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !Ref PaymentResource
+      PathPart: !Ref WebhookPathToken
+
+  PaymentMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ResourceId: !Ref PaymentTokenResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PaymentWebhookFunction.Arn}/invocations'
+
+  # /honeybee/<token>
+  HoneybeeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !GetAtt WebhookApi.RootResourceId
+      PathPart: honeybee
+
+  HoneybeeTokenResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !Ref HoneybeeResource
+      PathPart: !Ref WebhookPathToken
+
+  HoneybeeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ResourceId: !Ref HoneybeeTokenResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HoneybeeWebhookFunction.Arn}/invocations'
+
+  # API Gateway deployments are immutable: rename this resource (V2, V3...)
+  # whenever routes change so a new deployment is created.
+  ApiDeploymentV1:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - IntakeMethod
+      - AppointmentMethod
+      - PaymentMethod
+      - HoneybeeMethod
+    Properties:
+      RestApiId: !Ref WebhookApi
+
+  WebhookApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ClientName}-webhooks-${Environment}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref WebhookApi
+      DeploymentId: !Ref ApiDeploymentV1
+      StageName: !Ref Environment
+      AccessLogSetting:
+        DestinationArn: !GetAtt WebhookApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","integrationLatency":"$context.integrationLatency","userAgent":"$context.identity.userAgent"}'
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 50
+          ThrottlingBurstLimit: 100
+          # Requires the account-level API Gateway CloudWatch role, which is
+          # configured by ApiGatewayAccount in webui.yaml (deploy webui first).
+          LoggingLevel: INFO
+          DataTraceEnabled: !If [IsProduction, false, true]
+          MetricsEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  # ============================================================================
+  # WAF FOR WEBHOOK API PROTECTION
+  # ============================================================================
+  # Rule overrides carried over from buzzflow:
+  # - SizeRestrictions_BODY -> Count: large webhook bodies exceed the 8KB
+  #   body-inspection cutoff.
+  # - NoUserAgent_HEADER -> Count: IntakeQ webhook posts send NO User-Agent
+  #   header; the default Block action 403'd every intake webhook.
+  # TODO: add an IPSet allowlist rule for the /honeybee route once Honeybee's
+  # published egress IPs are known (they may change).
+
+  WebhookApiWAF:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${ClientName}-webhook-api-waf-${Environment}'
+      Scope: REGIONAL
+      Description: 'WAF for Pills By Post webhook API'
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: RateLimitPerIP
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: 100
+              AggregateKeyType: IP
+          Action:
+            Block:
+              CustomResponse:
+                ResponseCode: 429
+                CustomResponseBodyKey: RateLimitExceeded
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIP
+
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 2
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              RuleActionOverrides:
+                - Name: SizeRestrictions_BODY
+                  ActionToUse:
+                    Count: {}
+                - Name: NoUserAgent_HEADER
+                  ActionToUse:
+                    Count: {}
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 3
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSet
+
+      CustomResponseBodies:
+        RateLimitExceeded:
+          ContentType: APPLICATION_JSON
+          Content: '{"error":"Rate limit exceeded","message":"Too many requests. Please try again in a few minutes.","retryAfter":300}'
+
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ClientName}WebhookApiWAF'
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  WebhookApiWAFAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn:
+      - ApiStage
+    Properties:
+      ResourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/restapis/${WebhookApi}/stages/${Environment}'
+      WebACLArn: !GetAtt WebhookApiWAF.Arn
+
+  # ============================================================================
+  # OPS ALERTING — SNS TOPIC + CLOUDWATCH ALARMS
+  # ============================================================================
+
+  OpsAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ClientName}-${Environment}-ops-alerts'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ClientName
+
+  OpsAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OpsAlertsTopic
+      Protocol: email
+      Endpoint: !Ref OpsAlertEmail
+
+  IntakeWebhookErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClientName}-${Environment}-intake-webhook-errors'
+      AlarmDescription: 'intake-webhook Lambda reported errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IntakeWebhookFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+  IntakeWorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClientName}-${Environment}-intake-worker-errors'
+      AlarmDescription: 'intake-worker Lambda reported errors (intake processing failing)'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IntakeWorkerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+  AppointmentWebhookErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClientName}-${Environment}-appointment-webhook-errors'
+      AlarmDescription: 'appointment-webhook Lambda reported errors (orders not being created)'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AppointmentWebhookFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+  PaymentWebhookErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClientName}-${Environment}-payment-webhook-errors'
+      AlarmDescription: 'payment-webhook Lambda reported errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PaymentWebhookFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+  HoneybeeWebhookErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClientName}-${Environment}-honeybee-webhook-errors'
+      AlarmDescription: 'honeybee-webhook Lambda reported errors (Nectar events not being processed)'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref HoneybeeWebhookFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+  NectarOrderSubmitErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClientName}-${Environment}-nectar-order-submit-errors'
+      AlarmDescription: 'nectar-order-submit Lambda reported errors (fill requests not reaching Honeybee)'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NectarOrderSubmitFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+  SESNotificationErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClientName}-${Environment}-ses-notifications-errors'
+      AlarmDescription: 'ses-notifications Lambda reported errors (bounce/complaint suppression failing)'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SESNotificationFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+  TrackingProcessEntryErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClientName}-${Environment}-tracking-process-entry-errors'
+      AlarmDescription: 'tracking-process-entry Lambda reported errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TrackingProcessEntryFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+  TrackingBatchFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClientName}-${Environment}-tracking-batch-failed'
+      AlarmDescription: 'Tracking batch Step Functions execution failed'
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref TrackingBatchStateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+  IntakeDLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClientName}-${Environment}-intake-dlq-messages'
+      AlarmDescription: 'Intake messages exhausted SQS retries and landed in the DLQ - manual investigation required'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt IntakeDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+  NectarOrderDLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ClientName}-${Environment}-nectar-order-dlq-messages'
+      AlarmDescription: 'Nectar fill requests exhausted SQS retries and landed in the DLQ - order NOT submitted to Honeybee'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt NectarOrderDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsAlertsTopic
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+Outputs:
+  ApiGatewayUrl:
+    Description: 'Webhook API base URL'
+    Value: !Sub 'https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiUrl'
+
+  IntakeWebhookUrl:
+    Description: 'IntakeQ intake webhook URL (configure in IntakeQ > Integrations > Webhooks)'
+    Value: !Sub 'https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/intake/${WebhookPathToken}'
+
+  AppointmentWebhookUrl:
+    Description: 'IntakeQ appointment webhook URL'
+    Value: !Sub 'https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/appointment/${WebhookPathToken}'
+
+  PaymentWebhookUrl:
+    Description: 'Converge payment notification URL (decision D4)'
+    Value: !Sub 'https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/payment/${WebhookPathToken}'
+
+  HoneybeeWebhookUrl:
+    Description: 'Honeybee Partners API webhook URL (register with Honeybee)'
+    Value: !Sub 'https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/honeybee/${WebhookPathToken}'
+
+  IntakesTableName:
+    Value: !Ref IntakesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-IntakesTable'
+
+  OrdersTableName:
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTable'
+
+  HoneybeeEventsTableName:
+    Value: !Ref HoneybeeEventsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-HoneybeeEventsTable'
+
+  TrackingTableName:
+    Value: !Ref TrackingTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TrackingTable'
+
+  TrackingJobsTableName:
+    Value: !Ref TrackingJobsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TrackingJobsTable'
+
+  NectarOrderQueueUrl:
+    Value: !Ref NectarOrderQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-NectarOrderQueueUrl'
+
+  TrackingBatchStateMachineArn:
+    Value: !Ref TrackingBatchStateMachine
+
+  LambdaExecutionRoleArn:
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRole'
+
+  SESConfigurationSetName:
+    Value: !Ref SESConfigurationSet
+    Export:
+      Name: !Sub '${AWS::StackName}-SESConfigurationSet'
+
+  OpsAlertsTopicArn:
+    Value: !Ref OpsAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-OpsAlertsTopic'

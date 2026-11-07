@@ -1,0 +1,89 @@
+name: Deploy Lambda to DEV
+
+# Function name = <input>-dev; no per-function case block to maintain.
+# common/ is bundled into each package by scripts/build-lambda.sh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      function:
+        description: 'Lambda function to deploy'
+        required: true
+        type: choice
+        options:
+          - all
+          - intake-webhook
+          - intake-worker
+          - appointment-webhook
+          - payment-webhook
+          - honeybee-webhook
+          - nectar-order-submit
+          - tracking-initiate
+          - tracking-process-entry
+          - admin-crud-handler
+          - ses-notifications
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  ENVIRONMENT: dev
+  MANAGEMENT_ROLE: arn:aws:iam::830856739018:role/GitHubActionsRole
+  DEPLOY_ROLE: arn:aws:iam::881746719623:role/pillsbypost-WebDeploy-dev
+
+jobs:
+  deploy-dev:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Resolve function list
+        id: fns
+        run: |
+          if [ "${{ github.event.inputs.function }}" = "all" ]; then
+            LIST=$(ls -d lambdas/*/ | xargs -n1 basename | tr '\n' ' ')
+          else
+            LIST="${{ github.event.inputs.function }}"
+          fi
+          echo "list=$LIST" >> "$GITHUB_OUTPUT"
+          echo "Deploying: $LIST"
+
+      - name: Build packages
+        run: |
+          for fn in ${{ steps.fns.outputs.list }}; do
+            scripts/build-lambda.sh "$fn"
+          done
+
+      - name: Configure AWS credentials (management account via OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.MANAGEMENT_ROLE }}
+          role-session-name: github-actions-session
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Assume dev deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          role-session-name: dev-lambda-deploy
+          aws-region: ${{ env.AWS_REGION }}
+          role-chaining: true
+
+      - name: Deploy
+        run: |
+          for fn in ${{ steps.fns.outputs.list }}; do
+            echo "== $fn-${ENVIRONMENT}"
+            aws lambda update-function-code \
+              --function-name "$fn-${ENVIRONMENT}" \
+              --zip-file "fileb://lambdas/$fn/deployment_package.zip" \
+              --query 'FunctionName' --output text
+            aws lambda wait function-updated --function-name "$fn-${ENVIRONMENT}"
+          done
