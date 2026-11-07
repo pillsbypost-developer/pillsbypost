@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Pills By Post - GitHub Actions OIDC provider and GitHubActionsRole.
+  Deploy ONCE in the MANAGEMENT account (830856739018). The role may only
+  assume the per-environment deploy roles created by webui.yaml in the
+  workload accounts (pillsbypost-WebDeploy-dev / -prod).
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: pillsbypost-developer
+    Description: GitHub account or organization that owns the repository
+  GitHubRepo:
+    Type: String
+    Default: pillsbypost
+    Description: Repository name
+  DevAccountId:
+    Type: String
+    Default: '881746719623'
+    AllowedPattern: '^[0-9]{12}$'
+  ProdAccountId:
+    Type: String
+    Default: '772530610076'
+    AllowedPattern: '^[0-9]{12}$'
+  DeployRoleName:
+    Type: String
+    Default: pillsbypost-WebDeploy
+    Description: Deploy role name prefix in the workload accounts (suffix -dev / -prod is appended)
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # Thumbprint is no longer used by AWS for GitHub's provider (AWS pins its
+      # own trust store), but the property is still required by CloudFormation.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+      Tags:
+        - Key: Project
+          Value: pillsbypost
+
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GitHubActionsRole
+      Description: Assumed by GitHub Actions in the pillsbypost repo via OIDC; may only chain into the workload deploy roles
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !GetAtt GitHubOidcProvider.Arn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOwner}/${GitHubRepo}:*'
+      Policies:
+        - PolicyName: AssumeWorkloadDeployRoles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                  - sts:TagSession
+                Resource:
+                  - !Sub 'arn:aws:iam::${DevAccountId}:role/${DeployRoleName}-dev'
+                  - !Sub 'arn:aws:iam::${ProdAccountId}:role/${DeployRoleName}-prod'
+      Tags:
+        - Key: Project
+          Value: pillsbypost
+
+Outputs:
+  OidcProviderArn:
+    Value: !GetAtt GitHubOidcProvider.Arn
+  GitHubActionsRoleArn:
+    Description: Use as role-to-assume in the first configure-aws-credentials step of every workflow
+    Value: !GetAtt GitHubActionsRole.Arn
