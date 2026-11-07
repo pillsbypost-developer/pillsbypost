@@ -14,6 +14,14 @@ Parameters:
     Type: String
     Default: pillsbypost
     Description: Repository name
+  GitHubOwnerId:
+    Type: String
+    Default: '353844825'
+    Description: Numeric GitHub id of the owner account (GET https://api.github.com/users/<owner> -> id)
+  GitHubRepoId:
+    Type: String
+    Default: '1449653194'
+    Description: Numeric GitHub id of the repository (GET https://api.github.com/repos/<owner>/<repo> -> id)
   DevAccountId:
     Type: String
     Default: '881746719623'
@@ -58,8 +66,14 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              # Since 2026 GitHub embeds numeric ids in the sub claim:
+              #   repo:<owner>@<owner_id>/<repo>@<repo_id>:ref:refs/heads/main
+              # Both the id-pinned form (current) and the plain form (legacy)
+              # are accepted so the policy survives either format.
               StringLike:
-                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOwner}/${GitHubRepo}:*'
+                token.actions.githubusercontent.com:sub:
+                  - !Sub 'repo:${GitHubOwner}@${GitHubOwnerId}/${GitHubRepo}@${GitHubRepoId}:*'
+                  - !Sub 'repo:${GitHubOwner}/${GitHubRepo}:*'
       Policies:
         - PolicyName: AssumeWorkloadDeployRoles
           PolicyDocument:
