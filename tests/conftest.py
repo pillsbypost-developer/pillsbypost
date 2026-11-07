@@ -120,6 +120,7 @@ DEFAULT_SETTINGS = {
     'fulfillment_mode': 'shipping',
     'local_pharmacy_appointment_type_ids': 'svc-local',
     'practitioner_id': 'prac-1',
+    'intake_questionnaire_ids': '',
     'honeybee_shipping_method_id': '7',
     'honeybee_workflow': 'partner_requested',
     'tracking_retention_days': '45',

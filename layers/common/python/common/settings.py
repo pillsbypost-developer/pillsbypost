@@ -82,6 +82,12 @@ class Settings:
         return [s.strip() for s in str(raw).split(',') if s.strip()]
 
     @property
+    def intake_questionnaire_ids(self):
+        """IntakeQ questionnaire ids treated as main intake forms (empty = use name heuristics)."""
+        raw = self.get('intake_questionnaire_ids') or ''
+        return [s.strip() for s in str(raw).split(',') if s.strip()]
+
+    @property
     def practitioner_id(self):
         """IntakeQ PractitionerId of the provider (empty = not enforced)."""
         value = self.get('practitioner_id')

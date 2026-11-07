@@ -6,8 +6,9 @@ import boto3
 import requests
 from botocore.exceptions import ClientError
 
-# (connect, read) timeouts in seconds for all IntakeQ API calls.
-REQUEST_TIMEOUT = (5, 30)
+# (connect, read) timeouts in seconds for all IntakeQ API calls. Full intake
+# fetches for long forms with consents have been observed to exceed 30s.
+REQUEST_TIMEOUT = (5, 90)
 
 
 class IntakeQClient:

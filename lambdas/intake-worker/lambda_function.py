@@ -62,12 +62,28 @@ email_service = EmailService(logger, settings=settings, email_templates_table=em
 # Helpers
 # ---------------------------------------------------------------------------
 
-def is_main_intake_form(questionnaire_name):
-    """Main intake forms only (not follow-up, consent, reminder, research)."""
+def is_main_intake_form(questionnaire_name, questionnaire_id=None):
+    """
+    Decide whether an intake is a main intake form (vs follow-up, consent,
+    reminder, research questionnaires).
+
+    If the `intake_questionnaire_ids` setting lists IntakeQ questionnaire ids,
+    that list is authoritative. Otherwise fall back to name heuristics: names
+    containing follow/reminder/research are skipped; 'consent' skips a form
+    only when the name does not also say 'intake' (PBP's main form is
+    "Medication Abortion Intake Form With Consents").
+    """
+    allowed_ids = settings.intake_questionnaire_ids
+    if allowed_ids:
+        return str(questionnaire_id) in allowed_ids
     if not questionnaire_name:
         return False
     name = questionnaire_name.lower()
-    return not any(keyword in name for keyword in ('follow', 'consent', 'reminder', 'research'))
+    if any(keyword in name for keyword in ('follow', 'reminder', 'research')):
+        return False
+    if 'consent' in name and 'intake' not in name:
+        return False
+    return True
 
 
 def validate_required_fields(client_data, intake_data):
@@ -414,7 +430,7 @@ def process_intake_message(body):
     logger.log('DEBUG', "Full intake data from IntakeQ", intake_data=intake_data)
 
     questionnaire_name = intake_data.get('QuestionnaireName', '')
-    if not is_main_intake_form(questionnaire_name):
+    if not is_main_intake_form(questionnaire_name, intake_data.get('QuestionnaireId')):
         logger.log('INFO', "Skipping non-intake form", questionnaire_name=questionnaire_name)
         update_claim_record(intake_id, {
             'status': 'SKIPPED_NON_INTAKE',
